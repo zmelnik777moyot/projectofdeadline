@@ -1,23 +1,64 @@
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 import asyncio
 import logging
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters.command import Command
+import sqlite3
 
 # Включаем логирование, чтобы не пропустить важные сообщения
+conn = sqlite3.connect('polz.db') 
+cursor = conn.cursor() 
 logging.basicConfig(level=logging.INFO)
 # Объект бота
 bot = Bot(token="8469594997:AAGw-wNxW4e-vPYAR50ROcrfW8Y5gTRJxc8")
 # Диспетчер
 dp = Dispatcher()
 
-# Хэндлер на команду /start
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    await message.answer("Hello!")
 
-# Запуск процесса поллинга новых апдейтов
+
+
+
+@dp.message(Command("start"))
+async def start_handler(message: types.Message):
+    kb = types.ReplyKeyboardMarkup(
+        keyboard=[
+            [types.KeyboardButton(text="📱 Отправить мой номер", request_contact=True)]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+    await message.answer(
+        "Привет! Для регистрации, пожалуйста, отправь свой номер телефона:",
+        reply_markup=kb
+    )
+
+# Обработка контакта
+@dp.message(lambda message: message.contact is not None)
+async def contact_handler(message: types.Message):
+    contact = message.contact
+    user_id = message.from_user.id
+    phone = contact.phone_number
+    first_name = contact.first_name
+
+    cursor.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, first_name TEXT, phone TEXT)")
+    cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+    if cursor.fetchone() is None:
+        cursor.execute("INSERT INTO users (user_id, first_name, phone) VALUES (?, ?, ?)",
+                       (user_id, first_name, phone))
+        conn.commit()
+        await message.answer(
+            f"✅ Спасибо, {first_name}! Ты успешно зарегистрирован.\n Теперь можешь добавлять расписание 📅",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
+    else:
+        await message.answer(
+            "Ты уже зарегистрирован ✅",
+            reply_markup=types.ReplyKeyboardRemove()
+        )
+
 async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
+    import asyncio
     asyncio.run(main())
