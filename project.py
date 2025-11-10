@@ -12,7 +12,7 @@ from pydub import AudioSegment
 import io
 from datetime import datetime, timedelta
 import os
-
+import aiogram 
 # Включаем логирование, чтобы не пропустить важные сообщения
 conn = sqlite3.connect('polz.db') 
 cursor = conn.cursor()
