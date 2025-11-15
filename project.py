@@ -158,7 +158,6 @@ async def start_handler(message: types.Message):
         first_name = result[0]
         kb = ReplyKeyboardMarkup(
             keyboard=[
-                [KeyboardButton(text="📅 Составить расписание")],
                 [KeyboardButton(text="⏰ Создать напоминание")]
             ],
             resize_keyboard=True
@@ -196,7 +195,6 @@ async def contact_handler(message: types.Message):
             f"✅ Спасибо, {first_name}! Ты успешно зарегистрирован.\nТеперь можешь добавить своё расписание 📅",
             reply_markup=ReplyKeyboardMarkup(
                 keyboard=[
-                    [KeyboardButton(text="📅 Составить расписание")],
                     [KeyboardButton(text="⏰ Создать напоминание")]
                 ],
                 resize_keyboard=True
@@ -207,42 +205,17 @@ async def contact_handler(message: types.Message):
             "Ты уже зарегистрирован ✅",
             reply_markup=ReplyKeyboardMarkup(
                 keyboard=[
-                    [KeyboardButton(text="📅 Составить расписание")],
                     [KeyboardButton(text="⏰ Создать напоминание")]
                 ],
                 resize_keyboard=True
             )
         )
 
-@dp.message(Command("schedule"))
-async def schedule_command(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
-    if cursor.fetchone() is None:
-        await message.answer("⚠️ Сначала зарегистрируйся через /start, чтобы добавить расписание.")
-        return
 
-    await message.answer("📅 На какой день недели хочешь добавить расписание?")
-    await state.set_state(ScheduleForm.waiting_for_day)
+    # cursor.execute("INSERT INTO schedule (user_id, day, text) VALUES (?, ?, ?)", (user_id, day, text))
+    # conn.commit() внимание   
 
-@dp.message(ScheduleForm.waiting_for_day)
-async def schedule_day(message: types.Message, state: FSMContext):
-    await state.update_data(day=message.text)
-    await message.answer("✏️ Отлично! Теперь отправь текст расписания (например, «Учёба с 9:00 до 14:00»).")
-    await state.set_state(ScheduleForm.waiting_for_text)
-
-@dp.message(ScheduleForm.waiting_for_text)
-async def schedule_text(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    day = data["day"]
-    text = message.text
-    user_id = message.from_user.id
-
-    cursor.execute("INSERT INTO schedule (user_id, day, text) VALUES (?, ?, ?)", (user_id, day, text))
-    conn.commit()
-
-    await message.answer(f"✅ Расписание на *{day}* добавлено:\n_{text}_", parse_mode="Markdown")
-    await state.clear()
+   
 
 # Новые функции для напоминаний
 @dp.message(Command("reminder"))
