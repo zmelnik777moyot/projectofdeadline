@@ -71,79 +71,213 @@ class ReminderForm(StatesGroup):
     waiting_for_day = State()
     waiting_for_time = State()
 
-# Нейросеть для распознавания дат из текста (упрощенная версия)
+# Нейросеть для распознавания дат из текста
 class DateParser:
-    def parse_date_from_text(self, text):
-        """
-        Парсит дату и время из текста
-        Возвращает datetime объект или None если не удалось распознать
-        """
-        text = text.lower()
-        
-        # Текущая дата для отсчета
+    MONTHS = {
+        "января": 1, "февраля": 2, "марта": 3, "апреля": 4,
+        "мая": 5, "июня": 6, "июля": 7, "августа": 8,
+        "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12
+    }
+
+    WEEKDAYS = {
+        "понедельник": 0, "вторник": 1, "среда": 2,
+        "четверг": 3, "пятница": 4, "суббота": 5, "воскресенье": 6
+    }
+
+    WEEKDAY_FORMS = {
+        "понедельник": ["понедельник", "понедельникe", "в понедельник"],
+        "вторник": ["вторник", "во вторник"],
+        "среда": ["среда", "среду", "в среду"],
+        "четверг": ["четверг", "в четверг"],
+        "пятница": ["пятница", "пятницу", "в пятницу"],
+        "суббота": ["суббота", "субботу", "в субботу"],
+        "воскресенье": ["воскресенье", "в воскресенье"]
+    }
+
+    # Настройки периодов дня по умолчанию
+    PERIODS = {
+        "утро": (6, 12),
+        "день": (12, 18),
+        "вечер": (18, 0),
+        "ночь": (0, 6)
+    }
+
+    def parse_date_from_text(self, text: str) -> datetime:
+        text = (text or "").lower().strip()
         now = datetime.now()
-        
-        # Распознавание относительных дат
-        if 'сегодня' in text:
+
+        # --- Обработка относительных времен ---
+        m = re.search(r"через\s+(\d+)\s*час", text)
+        if m:
+            hours = int(m.group(1))
+            m2 = re.search(r"(\d+)\s*мин", text)
+            minutes = int(m2.group(1)) if m2 else 0
+            return now + timedelta(hours=hours, minutes=minutes)
+        m = re.search(r"через\s+(\d+)\s*мин", text)
+        if m:
+            minutes = int(m.group(1))
+            return now + timedelta(minutes=minutes)
+        if "через полчаса" in text:
+            return now + timedelta(minutes=30)
+        m = re.search(r"через\s+(\d+)\s*дн", text)
+        if m:
+            days = int(m.group(1))
+            return now + timedelta(days=days)
+        m = re.search(r"через\s+(\d+)\s*нед", text)
+        if m:
+            weeks = int(m.group(1))
+            return now + timedelta(weeks=weeks)
+        if "через неделю" in text:
+            return now + timedelta(weeks=1)
+
+        # --- Обработка дней недели ---
+        date = None
+        for base_name, forms in self.WEEKDAY_FORMS.items():
+            if any(f in text for f in forms):
+                weekday = self.WEEKDAYS[base_name]
+                today_wd = now.weekday()
+
+                # "в эту/этот <день>" — ближайший в текущей неделе
+                if "эту" in text or "этот" in text:
+                    delta = weekday - today_wd
+                    if delta < 0:
+                        delta += 7
+                    date = (now + timedelta(days=delta)).date()
+                    break
+
+                # "в следующую/следующий <день>" — на следующей неделе
+                if "следующ" in text:
+                    delta = (weekday - today_wd) % 7
+                    delta = delta + 7 if delta == 0 else delta + 7
+                    date = (now + timedelta(days=delta)).date()
+                    break
+
+                # просто "в <день>" — ближайший
+                delta = (weekday - today_wd) % 7
+                if delta == 0:
+                    delta = 7
+                date = (now + timedelta(days=delta)).date()
+                break
+
+        # --- Абсолютные даты (dd.mm.yyyy, dd.mm, dd month yyyy, dd month) ---
+        if date is None:
+            m = re.search(r"(\d{1,2})[./](\d{1,2})[./](\d{4})", text)
+            if m:
+                d, mo, y = map(int, m.groups())
+                try:
+                    date = datetime(y, mo, d).date()
+                except ValueError:
+                    date = None
+        if date is None:
+            m = re.search(r"(\d{1,2})[./](\d{1,2})\b", text)
+            if m:
+                d, mo = map(int, m.groups())
+                y = now.year
+                try:
+                    candidate = datetime(y, mo, d)
+                    if candidate < now:
+                        candidate = candidate.replace(year=y + 1)
+                    date = candidate.date()
+                except ValueError:
+                    date = None
+        if date is None:
+            m = re.search(r"(\d{1,2})\s+([а-яё]+)\s+(\d{4})", text)
+            if m:
+                d = int(m.group(1))
+                mon = m.group(2)
+                y = int(m.group(3))
+                mo = self.MONTHS.get(mon)
+                if mo:
+                    try:
+                        date = datetime(y, mo, d).date()
+                    except ValueError:
+                        date = None
+        if date is None:
+            m = re.search(r"(\d{1,2})\s+([а-яё]+)\b", text)
+            if m:
+                d = int(m.group(1))
+                mon = m.group(2)
+                mo = self.MONTHS.get(mon)
+                if mo:
+                    y = now.year
+                    try:
+                        candidate = datetime(y, mo, d)
+                        if candidate < now:
+                            candidate = candidate.replace(year=y + 1)
+                        date = candidate.date()
+                    except ValueError:
+                        date = None
+
+        if date is None:
             date = now.date()
-        elif 'завтра' in text:
-            date = now.date() + timedelta(days=1)
-        elif 'послезавтра' in text:
-            date = now.date() + timedelta(days=2)
-        elif 'через' in text and 'день' in text:
-            days_match = re.search(r'через\s+(\d+)\s+день', text)
-            if days_match:
-                days = int(days_match.group(1))
-                date = now.date() + timedelta(days=days)
+
+        # --- Обработка времени ---
+        hour = None
+        minute = None
+
+        # 1) Точное время 10:30
+        m = re.search(r"(\d{1,2})[:.](\d{2})", text)
+        if m:
+            hour, minute = int(m.group(1)), int(m.group(2))
+
+        else:
+            # 2) Время с указанием периода — «в 8 утра»
+            m = re.search(r"в\s*(\d{1,2})(?:\s*(утра|вечера|дня|ночи))?", text)
+            if m:
+                hour = int(m.group(1))
+                minute = 0
+                period = m.group(2)
+
+                if period:
+                    if period in ("вечера", "дня") and hour < 12:
+                        hour += 12
+                    if period == "ночи" and hour == 12:
+                        hour = 0
+
             else:
-                date = now.date() + timedelta(days=1)
-        else:
-            date = now.date()
-        
-        # Распознавание времени
-        time_match = re.search(r'(\d{1,2})[:\s]?(\d{2})?\s*(утра|вечера|ночи|дня|am|pm)?', text)
-        if time_match:
-            hour = int(time_match.group(1))
-            minute = int(time_match.group(2)) if time_match.group(2) else 0
-            period = time_match.group(3)
-            
-            # Корректировка времени в зависимости от периода
-            if period in ['вечера', 'ночи', 'pm'] and hour < 12:
-                hour += 12
-            elif period in ['утра', 'дня', 'am'] and hour == 12:
-                hour = 0
-        else:
-            # Время по умолчанию - текущее + 1 час
-            hour = now.hour + 1
-            minute = now.minute
-        
-        # Создаем datetime объект
-        try:
-            reminder_time = datetime(date.year, date.month, date.day, hour % 24, minute)
-            # Если время уже прошло сегодня, переносим на завтра
-            if reminder_time < now:
-                reminder_time += timedelta(days=1)
-            return reminder_time
-        except ValueError:
-            return None
+                # 3) просто период — «утром», «вечером»
+                m = re.search(r"(утро|день|вечер|ночь)", text)
+                if m:
+                    period = m.group(1)
+                    start_hour, _ = self.PERIODS.get(period, (9, 18))
+                    hour = start_hour
+                    minute = 0
+
+        if hour is None:
+            hour = now.hour
+        if minute is None:
+            minute = 0
+
+        result = datetime(date.year, date.month, date.day, hour % 24, minute)
+
+        # Если время прошло — переносим на завтра
+        if result < now:
+            result += timedelta(days=1)
+
+        return result
     
-    def extract_reminder_text(self, text):
-        """Извлекает текст напоминания, убирая временные указания"""
-        # Удаляем временные выражения
+    def extract_reminder_text(self, text: str) -> str:
+        if not text:
+            return "Напоминание"
+        clean = text.lower()
         patterns = [
-            r'сегодня', r'завтра', r'послезавтра', r'через\s+\d+\s+день',
-            r'в\s+\d{1,2}[:\s]?\d{0,2}\s*(утра|вечера|ночи|дня|am|pm)?',
-            r'\d{1,2}[:\s]?\d{0,2}\s*(утра|вечера|ночи|дня|am|pm)?'
+            r"сегодня", r"завтра", r"послезавтра",
+            r"через\s+\d+\s*(час|часа|часов|мин(ут)?|дн(ь|я|ей)|нед(я|ели)?)",
+            r"через\s+полчаса",
+            r"через\s+неделю",
+            r"в\s+следующ(ую|ий)\s+[а-яё]+",
+            r"в\s+эту\s+[а-яё]+",
+            r"в\s+этот\s+[а-яё]+",
+            r"в\s+[а-яё]+",
+            r"\d{1,2}[./]\d{1,2}([./]\d{2,4})?",
+            r"\d{1,2}[:.]\d{2}",
+            r"\d{1,2}\s+[а-яё]+(\s+\d{4})?"
         ]
-        
-        clean_text = text
-        for pattern in patterns:
-            clean_text = re.sub(pattern, '', clean_text, flags=re.IGNORECASE)
-        
-        # Убираем лишние пробелы
-        clean_text = re.sub(r'\s+', ' ', clean_text).strip()
-        
-        return clean_text if clean_text else "Напоминание"
+        for p in patterns:
+            clean = re.sub(p, "", clean, flags=re.I)
+        clean = re.sub(r"\bв\b", "", clean)
+        clean = re.sub(r"\s+", " ", clean).strip()
+        return clean.capitalize() if clean else "Напоминание"
 
 # Инициализация парсера дат
 date_parser = DateParser()
@@ -158,7 +292,8 @@ async def start_handler(message: types.Message):
         first_name = result[0]
         kb = ReplyKeyboardMarkup(
             keyboard=[
-                [KeyboardButton(text="⏰ Создать напоминание")]
+                [KeyboardButton(text="⏰ Создать напоминание")],
+                [KeyboardButton(text="⚙️ Настройки")]
             ],
             resize_keyboard=True
         )
@@ -169,7 +304,8 @@ async def start_handler(message: types.Message):
     else:
         kb = ReplyKeyboardMarkup(
             keyboard=[
-                [KeyboardButton(text="📱 Отправить мой номер", request_contact=True)]
+                [KeyboardButton(text="📱 Отправить мой номер", request_contact=True)],
+                [KeyboardButton(text="⚙️ Настройки")]
             ],
             resize_keyboard=True,
             one_time_keyboard=True
@@ -178,6 +314,52 @@ async def start_handler(message: types.Message):
             "Привет! 👋 Для регистрации, пожалуйста, отправь свой номер телефона:",
             reply_markup=kb
         )
+
+# =======================  
+#     Настройки периодов  
+# =======================
+@dp.message(Command("settings"))
+async def settings_handler(message: types.Message):
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔧 Настройка промежутков", callback_data="settings_periods")]
+        ]
+    )
+    await message.answer("⚙️ Настройки бота:", reply_markup=keyboard)
+
+# Обработчик текстовой кнопки "⚙️ Настройки" в ReplyKeyboard
+@dp.message(lambda m: m.text == "⚙️ Настройки")
+async def open_settings(message: types.Message):
+    # вызываем ту же функцию, что и команда /settings
+    await settings_handler(message)
+
+# Исправленный callback для кнопки внутри настроек
+@dp.callback_query(lambda c: c.data == "settings_periods")
+async def set_periods_callback(callback: types.CallbackQuery):
+    text = (
+        "🕒 Введи новые диапазоны периодов дня.\n"
+        "Формат: `период начало-конец`\n\n"
+        "Пример:\n"
+        "утро 06-12\n"
+        "день 12-18\n"
+        "вечер 18-00\n"
+        "ночь 00-06"
+    )
+    await callback.message.answer(text, parse_mode="Markdown")
+    await callback.answer()
+
+# Обработка вводимых настроек пользователем
+@dp.message(lambda m: m.text and re.search(r"^(утро|день|вечер|ночь)\s+\d{1,2}-\d{1,2}", m.text.lower()))
+async def update_periods(message: types.Message):
+    lines = message.text.lower().splitlines()
+
+    for line in lines:
+        m = re.match(r"(утро|день|вечер|ночь)\s+(\d{1,2})-(\d{1,2})", line)
+        if m:
+            period, start, end = m.groups()
+            date_parser.PERIODS[period] = (int(start), int(end))
+
+    await message.answer("✅ Периоды дня обновлены!")
 
 @dp.message(lambda message: message.contact is not None)
 async def contact_handler(message: types.Message):
@@ -195,7 +377,8 @@ async def contact_handler(message: types.Message):
             f"✅ Спасибо, {first_name}! Ты успешно зарегистрирован.\nТеперь можешь добавить своё расписание 📅",
             reply_markup=ReplyKeyboardMarkup(
                 keyboard=[
-                    [KeyboardButton(text="⏰ Создать напоминание")]
+                    [KeyboardButton(text="⏰ Создать напоминание")],
+                    [KeyboardButton(text="⚙️ Настройки")]
                 ],
                 resize_keyboard=True
             )
@@ -205,7 +388,8 @@ async def contact_handler(message: types.Message):
             "Ты уже зарегистрирован ✅",
             reply_markup=ReplyKeyboardMarkup(
                 keyboard=[
-                    [KeyboardButton(text="⏰ Создать напоминание")]
+                    [KeyboardButton(text="⏰ Создать напоминание")],
+                    [KeyboardButton(text="⚙️ Настройки")]
                 ],
                 resize_keyboard=True
             )
@@ -215,7 +399,7 @@ async def contact_handler(message: types.Message):
     # cursor.execute("INSERT INTO schedule (user_id, day, text) VALUES (?, ?, ?)", (user_id, day, text))
     # conn.commit() внимание   
 
-   
+
 
 # Новые функции для напоминаний
 @dp.message(Command("reminder"))
@@ -301,13 +485,7 @@ async def process_text_reminder(message: types.Message, state: FSMContext):
     
     await state.clear()
 
-# Обработка голосового напоминания - исправленная версия
-@dp.message(ReminderForm.waiting_for_voice)
-# Обработка голосового напоминания - сложная версия с полным распознаванием
-@dp.message(ReminderForm.waiting_for_voice)
-# Обработка голосового напоминания - сложная версия с полным распознаванием
-@dp.message(ReminderForm.waiting_for_voice)
-@dp.message(ReminderForm.waiting_for_voice)
+
 @dp.message(ReminderForm.waiting_for_voice)
 async def process_voice_reminder(message: types.Message, state: FSMContext):
     if not message.voice:
