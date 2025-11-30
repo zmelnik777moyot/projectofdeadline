@@ -13,8 +13,21 @@ import io
 from datetime import datetime, timedelta
 import os
 import aiogram 
+from functools import lru_cache, wraps
+import time
+
 # Включаем логирование, чтобы не пропустить важные сообщения
-conn = sqlite3.connect('polz.db') 
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('bot.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+
+conn = sqlite3.connect('polz.db', check_same_thread=False) 
+conn.row_factory = sqlite3.Row  # Для доступа к колонкам по имени
 cursor = conn.cursor()
 
 # Создаем таблицы если их нет
@@ -45,18 +58,36 @@ CREATE TABLE IF NOT EXISTS reminders (
     user_id INTEGER,
     reminder_text TEXT,
     reminder_time TIMESTAMP,
+    sent INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (user_id) REFERENCES users (user_id)
 )
 ''')
 
+# Добавляем колонку для повторяющихся напоминаний если её нет
+try:
+    cursor.execute("ALTER TABLE reminders ADD COLUMN repeat_pattern TEXT")
+except sqlite3.OperationalError:
+    pass  # Колонка уже существует
+
 conn.commit()
 
-logging.basicConfig(level=logging.INFO)
 # Объект бота
 bot = Bot(token="8469594997:AAGw-wNxW4e-vPYAR50ROcrfW8Y5gTRJxc8")
 # Диспетчер
 dp = Dispatcher()
+
+# Декоратор для проверки регистрации
+def user_registered(func):
+    @wraps(func)
+    async def wrapper(message: types.Message, *args, **kwargs):
+        user_id = message.from_user.id
+        cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+        if not cursor.fetchone():
+            await message.answer("⚠️ Сначала зарегистрируйтесь через /start")
+            return
+        return await func(message, *args, **kwargs)
+    return wrapper
 
 class ScheduleForm(StatesGroup):
     waiting_for_day = State()
@@ -70,6 +101,7 @@ class ReminderForm(StatesGroup):
     waiting_for_month = State()
     waiting_for_day = State()
     waiting_for_time = State()
+    waiting_for_repeat = State()
 
 # Нейросеть для распознавания дат из текста
 class DateParser:
@@ -102,6 +134,12 @@ class DateParser:
         "ночь": (0, 6)
     }
 
+    @staticmethod
+    @lru_cache(maxsize=100)
+    def parse_date_from_text_cached(self, text: str) -> datetime:
+        """Кэшированная версия парсинга дат"""
+        return self.parse_date_from_text(text)
+
     def parse_date_from_text(self, text: str) -> datetime:
         text = (text or "").lower().strip()
         now = datetime.now()
@@ -113,20 +151,25 @@ class DateParser:
             m2 = re.search(r"(\d+)\s*мин", text)
             minutes = int(m2.group(1)) if m2 else 0
             return now + timedelta(hours=hours, minutes=minutes)
+        
         m = re.search(r"через\s+(\d+)\s*мин", text)
         if m:
             minutes = int(m.group(1))
             return now + timedelta(minutes=minutes)
+        
         if "через полчаса" in text:
             return now + timedelta(minutes=30)
+        
         m = re.search(r"через\s+(\d+)\s*дн", text)
         if m:
             days = int(m.group(1))
             return now + timedelta(days=days)
+        
         m = re.search(r"через\s+(\d+)\s*нед", text)
         if m:
             weeks = int(m.group(1))
             return now + timedelta(weeks=weeks)
+        
         if "через неделю" in text:
             return now + timedelta(weeks=1)
 
@@ -168,6 +211,7 @@ class DateParser:
                     date = datetime(y, mo, d).date()
                 except ValueError:
                     date = None
+        
         if date is None:
             m = re.search(r"(\d{1,2})[./](\d{1,2})\b", text)
             if m:
@@ -180,6 +224,7 @@ class DateParser:
                     date = candidate.date()
                 except ValueError:
                     date = None
+        
         if date is None:
             m = re.search(r"(\d{1,2})\s+([а-яё]+)\s+(\d{4})", text)
             if m:
@@ -192,6 +237,7 @@ class DateParser:
                         date = datetime(y, mo, d).date()
                     except ValueError:
                         date = None
+        
         if date is None:
             m = re.search(r"(\d{1,2})\s+([а-яё]+)\b", text)
             if m:
@@ -282,6 +328,41 @@ class DateParser:
 # Инициализация парсера дат
 date_parser = DateParser()
 
+# ========================
+# СИСТЕМА НАПОМИНАНИЙ
+# ========================
+
+async def reminder_scheduler():
+    """Фоновая задача для отправки напоминаний"""
+    while True:
+        try:
+            now = datetime.now()
+            cursor.execute("""
+                SELECT r.*, u.first_name 
+                FROM reminders r 
+                JOIN users u ON r.user_id = u.user_id 
+                WHERE r.reminder_time <= ? AND r.sent = 0
+            """, (now,))
+            reminders = cursor.fetchall()
+            
+            for reminder in reminders:
+                try:
+                    await bot.send_message(
+                        reminder['user_id'],
+                        f"🔔 *Напоминание!*\n\n{reminder['reminder_text']}",
+                        parse_mode="Markdown"
+                    )
+                    cursor.execute("UPDATE reminders SET sent = 1 WHERE id = ?", (reminder['id'],))
+                    conn.commit()
+                    logging.info(f"Напоминание отправлено пользователю {reminder['user_id']}")
+                except Exception as e:
+                    logging.error(f"Ошибка отправки напоминания {reminder['id']}: {e}")
+            
+            await asyncio.sleep(30)  # Проверка каждые 30 секунд
+        except Exception as e:
+            logging.error(f"Ошибка в scheduler: {e}")
+            await asyncio.sleep(60)
+
 @dp.message(Command("start"))
 async def start_handler(message: types.Message):
     user_id = message.from_user.id
@@ -293,6 +374,7 @@ async def start_handler(message: types.Message):
         kb = ReplyKeyboardMarkup(
             keyboard=[
                 [KeyboardButton(text="⏰ Создать напоминание")],
+                [KeyboardButton(text="📋 Мои напоминания")],
                 [KeyboardButton(text="⚙️ Настройки")]
             ],
             resize_keyboard=True
@@ -322,7 +404,8 @@ async def start_handler(message: types.Message):
 async def settings_handler(message: types.Message):
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🔧 Настройка промежутков", callback_data="settings_periods")]
+            [InlineKeyboardButton(text="🔧 Настройка промежутков", callback_data="settings_periods")],
+            [InlineKeyboardButton(text="📊 Статистика", callback_data="settings_stats")]
         ]
     )
     await message.answer("⚙️ Настройки бота:", reply_markup=keyboard)
@@ -330,7 +413,6 @@ async def settings_handler(message: types.Message):
 # Обработчик текстовой кнопки "⚙️ Настройки" в ReplyKeyboard
 @dp.message(lambda m: m.text == "⚙️ Настройки")
 async def open_settings(message: types.Message):
-    # вызываем ту же функцию, что и команда /settings
     await settings_handler(message)
 
 # Исправленный callback для кнопки внутри настроек
@@ -346,6 +428,26 @@ async def set_periods_callback(callback: types.CallbackQuery):
         "ночь 00-06"
     )
     await callback.message.answer(text, parse_mode="Markdown")
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "settings_stats")
+async def show_stats_callback(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    cursor.execute("""
+        SELECT 
+            COUNT(*) as total,
+            SUM(sent) as completed,
+            COUNT(*) - SUM(sent) as pending
+        FROM reminders WHERE user_id = ?
+    """, (user_id,))
+    
+    stats = cursor.fetchone()
+    await callback.message.answer(
+        f"📊 Ваша статистика:\n"
+        f"• Всего напоминаний: {stats['total']}\n"
+        f"• Выполнено: {stats['completed']}\n"
+        f"• Ожидают: {stats['pending']}"
+    )
     await callback.answer()
 
 # Обработка вводимых настроек пользователем
@@ -378,6 +480,7 @@ async def contact_handler(message: types.Message):
             reply_markup=ReplyKeyboardMarkup(
                 keyboard=[
                     [KeyboardButton(text="⏰ Создать напоминание")],
+                    [KeyboardButton(text="📋 Мои напоминания")],
                     [KeyboardButton(text="⚙️ Настройки")]
                 ],
                 resize_keyboard=True
@@ -389,28 +492,21 @@ async def contact_handler(message: types.Message):
             reply_markup=ReplyKeyboardMarkup(
                 keyboard=[
                     [KeyboardButton(text="⏰ Создать напоминание")],
+                    [KeyboardButton(text="📋 Мои напоминания")],
                     [KeyboardButton(text="⚙️ Настройки")]
                 ],
                 resize_keyboard=True
             )
         )
 
+# ========================
+# СИСТЕМА НАПОМИНАНИЙ
+# ========================
 
-    # cursor.execute("INSERT INTO schedule (user_id, day, text) VALUES (?, ?, ?)", (user_id, day, text))
-    # conn.commit() внимание   
-
-
-
-# Новые функции для напоминаний
 @dp.message(Command("reminder"))
 @dp.message(lambda message: message.text == "⏰ Создать напоминание")
+@user_registered
 async def reminder_command(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
-    if cursor.fetchone() is None:
-        await message.answer("⚠️ Сначала зарегистрируйся через /start, чтобы создать напоминание.")
-        return
-
     # Создаем инлайн-кнопки для выбора метода
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -484,7 +580,6 @@ async def process_text_reminder(message: types.Message, state: FSMContext):
         )
     
     await state.clear()
-
 
 @dp.message(ReminderForm.waiting_for_voice)
 async def process_voice_reminder(message: types.Message, state: FSMContext):
@@ -583,6 +678,32 @@ async def process_voice_reminder(message: types.Message, state: FSMContext):
                 except Exception:
                     pass
 
+# ========================
+# ПРОСМОТР НАПОМИНАНИЙ
+# ========================
+
+@dp.message(Command("my_reminders"))
+@dp.message(lambda message: message.text == "📋 Мои напоминания")
+@user_registered
+async def list_reminders(message: types.Message):
+    user_id = message.from_user.id
+    cursor.execute("""
+        SELECT id, reminder_text, reminder_time 
+        FROM reminders 
+        WHERE user_id = ? AND sent = 0 
+        ORDER BY reminder_time
+    """, (user_id,))
+    
+    reminders = cursor.fetchall()
+    if not reminders:
+        await message.answer("📭 У вас нет активных напоминаний")
+        return
+    
+    text = "📋 Ваши активные напоминания:\n\n"
+    for rem in reminders:
+        text += f"• {rem['reminder_text']} - {rem['reminder_time'].strftime('%d.%m.%Y %H:%M')}\n"
+    
+    await message.answer(text)
 
 # Функции для выбора даты через кнопки
 async def select_year(message: types.Message, state: FSMContext):
@@ -738,8 +859,15 @@ async def process_time(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(ReminderForm.waiting_for_text)
     await callback.answer()
 
-# Запуск бота
+# ========================
+# ЗАПУСК БОТА
+# ========================
+
 async def main():
+    # Запускаем фоновую задачу для напоминаний
+    asyncio.create_task(reminder_scheduler())
+    
+    logging.info("Бот запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
