@@ -1,3 +1,4 @@
+
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
@@ -9,14 +10,11 @@ import sqlite3
 import re
 import speech_recognition as sr
 from pydub import AudioSegment
-import io
-from datetime import datetime, timedelta
 import os
-import aiogram 
+from datetime import datetime, timedelta
 from functools import lru_cache, wraps
-import time
 
-# Включаем логирование, чтобы не пропустить важные сообщения
+# ---------- ЛОГИРОВАНИЕ ----------
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -26,11 +24,12 @@ logging.basicConfig(
     ]
 )
 
-conn = sqlite3.connect('polz.db', check_same_thread=False) 
-conn.row_factory = sqlite3.Row  # Для доступа к колонкам по имени
+# ---------- БД ----------
+conn = sqlite3.connect('polz.db', check_same_thread=False)
+conn.row_factory = sqlite3.Row
 cursor = conn.cursor()
 
-# Создаем таблицы если их нет
+# users
 cursor.execute('''
 CREATE TABLE IF NOT EXISTS users (
     user_id INTEGER PRIMARY KEY,
@@ -40,18 +39,7 @@ CREATE TABLE IF NOT EXISTS users (
 )
 ''')
 
-cursor.execute('''
-CREATE TABLE IF NOT EXISTS schedule (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
-    day TEXT,
-    text TEXT,
-    reminder_time TIMESTAMP,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (user_id) REFERENCES users (user_id)
-)
-''')
-
+# reminders (оставляем как есть)
 cursor.execute('''
 CREATE TABLE IF NOT EXISTS reminders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,24 +48,31 @@ CREATE TABLE IF NOT EXISTS reminders (
     reminder_time TIMESTAMP,
     sent INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    repeat_pattern TEXT,
     FOREIGN KEY (user_id) REFERENCES users (user_id)
 )
 ''')
 
-# Добавляем колонку для повторяющихся напоминаний если её нет
-try:
-    cursor.execute("ALTER TABLE reminders ADD COLUMN repeat_pattern TEXT")
-except sqlite3.OperationalError:
-    pass  # Колонка уже существует
+# schedule_items - новая таблица расписания (по датам)
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS schedule_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    title TEXT,
+    due_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users (user_id)
+)
+''')
 
 conn.commit()
 
-# Объект бота
-bot = Bot(token="8469594997:AAGw-wNxW4e-vPYAR50ROcrfW8Y5gTRJxc8")
-# Диспетчер
+# ---------- BOT ----------
+BOT_TOKEN = "8469594997:AAGw-wNxW4e-vPYAR50ROcrfW8Y5gTRJxc8"  # <- замените на свой токен
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Декоратор для проверки регистрации
+# ---------- ДЕКОРАТОР ПРОВЕРКИ РЕГИСТРАЦИИ ----------
 def user_registered(func):
     @wraps(func)
     async def wrapper(message: types.Message, *args, **kwargs):
@@ -89,10 +84,7 @@ def user_registered(func):
         return await func(message, *args, **kwargs)
     return wrapper
 
-class ScheduleForm(StatesGroup):
-    waiting_for_day = State()
-    waiting_for_text = State()
-
+# ---------- STATES ----------
 class ReminderForm(StatesGroup):
     waiting_for_method = State()
     waiting_for_text = State()
@@ -101,9 +93,15 @@ class ReminderForm(StatesGroup):
     waiting_for_month = State()
     waiting_for_day = State()
     waiting_for_time = State()
-    waiting_for_repeat = State()
 
-# Нейросеть для распознавания дат из текста
+class ScheduleForm(StatesGroup):
+    waiting_for_date = State()
+    waiting_for_title = State()
+    waiting_for_time = State()
+    editing_item = State()
+    editing_action = State()
+
+# ---------- PARSER (используем из старого кода) ----------
 class DateParser:
     MONTHS = {
         "января": 1, "февраля": 2, "марта": 3, "апреля": 4,
@@ -111,280 +109,112 @@ class DateParser:
         "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12
     }
 
-    WEEKDAYS = {
-        "понедельник": 0, "вторник": 1, "среда": 2,
-        "четверг": 3, "пятница": 4, "суббота": 5, "воскресенье": 6
-    }
-
-    WEEKDAY_FORMS = {
-        "понедельник": ["понедельник", "понедельникe", "в понедельник"],
-        "вторник": ["вторник", "во вторник"],
-        "среда": ["среда", "среду", "в среду"],
-        "четверг": ["четверг", "в четверг"],
-        "пятница": ["пятница", "пятницу", "в пятницу"],
-        "суббота": ["суббота", "субботу", "в субботу"],
-        "воскресенье": ["воскресенье", "в воскресенье"]
-    }
-
-    # Настройки периодов дня по умолчанию
-    PERIODS = {
-        "утро": (6, 12),
-        "день": (12, 18),
-        "вечер": (18, 0),
-        "ночь": (0, 6)
-    }
-
     @staticmethod
-    @lru_cache(maxsize=100)
-    def parse_date_from_text_cached(self, text: str) -> datetime:
-        """Кэшированная версия парсинга дат"""
-        return self.parse_date_from_text(text)
-
-    def parse_date_from_text(self, text: str) -> datetime:
+    @lru_cache(maxsize=200)
+    def parse_date_from_text(text: str) -> datetime:
         text = (text or "").lower().strip()
         now = datetime.now()
 
-        # --- Обработка относительных времен ---
+        # простой парсер: "через N часов/мин", "сегодня/завтра", "dd.mm.yyyy hh:mm", "dd.mm hh:mm"
         m = re.search(r"через\s+(\d+)\s*час", text)
         if m:
             hours = int(m.group(1))
-            m2 = re.search(r"(\d+)\s*мин", text)
-            minutes = int(m2.group(1)) if m2 else 0
-            return now + timedelta(hours=hours, minutes=minutes)
-        
-        m = re.search(r"через\s+(\d+)\s*мин", text)
-        if m:
-            minutes = int(m.group(1))
-            return now + timedelta(minutes=minutes)
-        
-        if "через полчаса" in text:
+            return now + timedelta(hours=hours)
+
+        if "через полчас" in text:
             return now + timedelta(minutes=30)
-        
-        m = re.search(r"через\s+(\d+)\s*дн", text)
-        if m:
-            days = int(m.group(1))
-            return now + timedelta(days=days)
-        
-        m = re.search(r"через\s+(\d+)\s*нед", text)
-        if m:
-            weeks = int(m.group(1))
-            return now + timedelta(weeks=weeks)
-        
-        if "через неделю" in text:
-            return now + timedelta(weeks=1)
 
-        # --- Обработка дней недели ---
-        date = None
-        for base_name, forms in self.WEEKDAY_FORMS.items():
-            if any(f in text for f in forms):
-                weekday = self.WEEKDAYS[base_name]
-                today_wd = now.weekday()
-
-                # "в эту/этот <день>" — ближайший в текущей неделе
-                if "эту" in text or "этот" in text:
-                    delta = weekday - today_wd
-                    if delta < 0:
-                        delta += 7
-                    date = (now + timedelta(days=delta)).date()
-                    break
-
-                # "в следующую/следующий <день>" — на следующей неделе
-                if "следующ" in text:
-                    delta = (weekday - today_wd) % 7
-                    delta = delta + 7 if delta == 0 else delta + 7
-                    date = (now + timedelta(days=delta)).date()
-                    break
-
-                # просто "в <день>" — ближайший
-                delta = (weekday - today_wd) % 7
-                if delta == 0:
-                    delta = 7
-                date = (now + timedelta(days=delta)).date()
-                break
-
-        # --- Абсолютные даты (dd.mm.yyyy, dd.mm, dd month yyyy, dd month) ---
-        if date is None:
-            m = re.search(r"(\d{1,2})[./](\d{1,2})[./](\d{4})", text)
+        if "сегодня" in text:
+            d = now.date()
+        elif "завтра" in text:
+            d = (now + timedelta(days=1)).date()
+        else:
+            m = re.search(r"(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?", text)
             if m:
-                d, mo, y = map(int, m.groups())
+                d = int(m.group(1)); mo = int(m.group(2)); y = m.group(3)
+                year = int(y) if y else now.year
                 try:
-                    date = datetime(y, mo, d).date()
-                except ValueError:
-                    date = None
-        
-        if date is None:
-            m = re.search(r"(\d{1,2})[./](\d{1,2})\b", text)
-            if m:
-                d, mo = map(int, m.groups())
-                y = now.year
-                try:
-                    candidate = datetime(y, mo, d)
-                    if candidate < now:
-                        candidate = candidate.replace(year=y + 1)
-                    date = candidate.date()
-                except ValueError:
-                    date = None
-        
-        if date is None:
-            m = re.search(r"(\d{1,2})\s+([а-яё]+)\s+(\d{4})", text)
-            if m:
-                d = int(m.group(1))
-                mon = m.group(2)
-                y = int(m.group(3))
-                mo = self.MONTHS.get(mon)
-                if mo:
-                    try:
-                        date = datetime(y, mo, d).date()
-                    except ValueError:
-                        date = None
-        
-        if date is None:
-            m = re.search(r"(\d{1,2})\s+([а-яё]+)\b", text)
-            if m:
-                d = int(m.group(1))
-                mon = m.group(2)
-                mo = self.MONTHS.get(mon)
-                if mo:
-                    y = now.year
-                    try:
-                        candidate = datetime(y, mo, d)
-                        if candidate < now:
-                            candidate = candidate.replace(year=y + 1)
-                        date = candidate.date()
-                    except ValueError:
-                        date = None
+                    return datetime(year, mo, d, now.hour, now.minute)
+                except:
+                    d = now.date()
+            else:
+                d = now.date()
 
-        if date is None:
-            date = now.date()
-
-        # --- Обработка времени ---
-        hour = None
-        minute = None
-
-        # 1) Точное время 10:30
+        # время
         m = re.search(r"(\d{1,2})[:.](\d{2})", text)
         if m:
-            hour, minute = int(m.group(1)), int(m.group(2))
-
+            h = int(m.group(1)); mi = int(m.group(2))
         else:
-            # 2) Время с указанием периода — «в 8 утра»
-            m = re.search(r"в\s*(\d{1,2})(?:\s*(утра|вечера|дня|ночи))?", text)
-            if m:
-                hour = int(m.group(1))
-                minute = 0
-                period = m.group(2)
-
-                if period:
-                    if period in ("вечера", "дня") and hour < 12:
-                        hour += 12
-                    if period == "ночи" and hour == 12:
-                        hour = 0
-
+            # период дня
+            if "утр" in text:
+                h, mi = 9, 0
+            elif "вечер" in text:
+                h, mi = 18, 0
             else:
-                # 3) просто период — «утром», «вечером»
-                m = re.search(r"(утро|день|вечер|ночь)", text)
-                if m:
-                    period = m.group(1)
-                    start_hour, _ = self.PERIODS.get(period, (9, 18))
-                    hour = start_hour
-                    minute = 0
+                h, mi = 9, 0
 
-        if hour is None:
-            hour = now.hour
-        if minute is None:
-            minute = 0
-
-        result = datetime(date.year, date.month, date.day, hour % 24, minute)
-
-        # Если время прошло — переносим на завтра
+        result = datetime(d.year, d.month, d.day, h % 24, mi)
         if result < now:
             result += timedelta(days=1)
-
         return result
-    
-    def extract_reminder_text(self, text: str) -> str:
+
+    @staticmethod
+    def extract_reminder_text(text: str) -> str:
         if not text:
             return "Напоминание"
-        clean = text.lower()
-        patterns = [
-            r"сегодня", r"завтра", r"послезавтра",
-            r"через\s+\d+\s*(час|часа|часов|мин(ут)?|дн(ь|я|ей)|нед(я|ели)?)",
-            r"через\s+полчаса",
-            r"через\s+неделю",
-            r"в\s+следующ(ую|ий)\s+[а-яё]+",
-            r"в\s+эту\s+[а-яё]+",
-            r"в\s+этот\s+[а-яё]+",
-            r"в\s+[а-яё]+",
-            r"\d{1,2}[./]\d{1,2}([./]\d{2,4})?",
-            r"\d{1,2}[:.]\d{2}",
-            r"\d{1,2}\s+[а-яё]+(\s+\d{4})?"
-        ]
-        for p in patterns:
-            clean = re.sub(p, "", clean, flags=re.I)
-        clean = re.sub(r"\bв\b", "", clean)
+        # удаляем упоминания дат/времени (простейшая версия)
+        clean = re.sub(r"\b(сегодня|завтра|через|утр|день|вечер|ночь|часов?|минут|через\s+\d+)\b", "", text, flags=re.I)
+        clean = re.sub(r"\d{1,2}[:.]\d{2}", "", clean)
+        clean = re.sub(r"\d{1,2}[./]\d{1,2}([./]\d{2,4})?", "", clean)
         clean = re.sub(r"\s+", " ", clean).strip()
         return clean.capitalize() if clean else "Напоминание"
 
-# Инициализация парсера дат
 date_parser = DateParser()
 
-# ========================
-# СИСТЕМА НАПОМИНАНИЙ
-# ========================
+# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
+def parse_datetime_from_db(dt_value):
+    if dt_value is None:
+        return None
+    if isinstance(dt_value, datetime):
+        return dt_value
+    if isinstance(dt_value, str):
+        formats = [
+            '%Y-%m-%d %H:%M:%S.%f',
+            '%Y-%m-%d %H:%M:%S',
+            '%Y-%m-%d %H:%M',
+            '%Y-%m-%d',
+            '%d.%m.%Y %H:%M:%S',
+            '%d.%m.%Y %H:%M',
+            '%d.%m.%Y'
+        ]
+        for fmt in formats:
+            try:
+                return datetime.strptime(dt_value, fmt)
+            except ValueError:
+                continue
+    return None
 
-async def reminder_scheduler():
-    """Фоновая задача для отправки напоминаний"""
-    while True:
-        try:
-            now = datetime.now()
-            cursor.execute("""
-                SELECT r.*, u.first_name 
-                FROM reminders r 
-                JOIN users u ON r.user_id = u.user_id 
-                WHERE r.reminder_time <= ? AND r.sent = 0
-            """, (now,))
-            reminders = cursor.fetchall()
-            
-            for reminder in reminders:
-                try:
-                    await bot.send_message(
-                        reminder['user_id'],
-                        f"🔔 *Напоминание!*\n\n{reminder['reminder_text']}",
-                        parse_mode="Markdown"
-                    )
-                    cursor.execute("UPDATE reminders SET sent = 1 WHERE id = ?", (reminder['id'],))
-                    conn.commit()
-                    logging.info(f"Напоминание отправлено пользователю {reminder['user_id']}")
-                except Exception as e:
-                    logging.error(f"Ошибка отправки напоминания {reminder['id']}: {e}")
-            
-            await asyncio.sleep(30)  # Проверка каждые 30 секунд
-        except Exception as e:
-            logging.error(f"Ошибка в scheduler: {e}")
-            await asyncio.sleep(60)
-
+# ---------- START / REGISTRATION / KEYBOARD ----------
 @dp.message(Command("start"))
 async def start_handler(message: types.Message):
     user_id = message.from_user.id
     cursor.execute("SELECT first_name FROM users WHERE user_id = ?", (user_id,))
     result = cursor.fetchone()
 
+    kb = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="⏰ Создать напоминание")],
+            [KeyboardButton(text="📋 Мои напоминания")],
+            [KeyboardButton(text="📅 Расписание")],
+            [KeyboardButton(text="⚙️ Настройки")]
+        ],
+        resize_keyboard=True
+    )
+
     if result:
-        first_name = result[0]
-        kb = ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="⏰ Создать напоминание")],
-                [KeyboardButton(text="📋 Мои напоминания")],
-                [KeyboardButton(text="⚙️ Настройки")]
-            ],
-            resize_keyboard=True
-        )
-        await message.answer(
-            f"Привет снова, {first_name}! 👋\nВыбери действие:",
-            reply_markup=kb
-        )
+        await message.answer(f"Привет снова, {result[0]}! 👋\nВыбери действие:", reply_markup=kb)
     else:
-        kb = ReplyKeyboardMarkup(
+        kb_reg = ReplyKeyboardMarkup(
             keyboard=[
                 [KeyboardButton(text="📱 Отправить мой номер", request_contact=True)],
                 [KeyboardButton(text="⚙️ Настройки")]
@@ -392,76 +222,7 @@ async def start_handler(message: types.Message):
             resize_keyboard=True,
             one_time_keyboard=True
         )
-        await message.answer(
-            "Привет! 👋 Для регистрации, пожалуйста, отправь свой номер телефона:",
-            reply_markup=kb
-        )
-
-# =======================  
-#     Настройки периодов  
-# =======================
-@dp.message(Command("settings"))
-async def settings_handler(message: types.Message):
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🔧 Настройка промежутков", callback_data="settings_periods")],
-            [InlineKeyboardButton(text="📊 Статистика", callback_data="settings_stats")]
-        ]
-    )
-    await message.answer("⚙️ Настройки бота:", reply_markup=keyboard)
-
-# Обработчик текстовой кнопки "⚙️ Настройки" в ReplyKeyboard
-@dp.message(lambda m: m.text == "⚙️ Настройки")
-async def open_settings(message: types.Message):
-    await settings_handler(message)
-
-# Исправленный callback для кнопки внутри настроек
-@dp.callback_query(lambda c: c.data == "settings_periods")
-async def set_periods_callback(callback: types.CallbackQuery):
-    text = (
-        "🕒 Введи новые диапазоны периодов дня.\n"
-        "Формат: `период начало-конец`\n\n"
-        "Пример:\n"
-        "утро 06-12\n"
-        "день 12-18\n"
-        "вечер 18-00\n"
-        "ночь 00-06"
-    )
-    await callback.message.answer(text, parse_mode="Markdown")
-    await callback.answer()
-
-@dp.callback_query(lambda c: c.data == "settings_stats")
-async def show_stats_callback(callback: types.CallbackQuery):
-    user_id = callback.from_user.id
-    cursor.execute("""
-        SELECT 
-            COUNT(*) as total,
-            SUM(sent) as completed,
-            COUNT(*) - SUM(sent) as pending
-        FROM reminders WHERE user_id = ?
-    """, (user_id,))
-    
-    stats = cursor.fetchone()
-    await callback.message.answer(
-        f"📊 Ваша статистика:\n"
-        f"• Всего напоминаний: {stats['total']}\n"
-        f"• Выполнено: {stats['completed']}\n"
-        f"• Ожидают: {stats['pending']}"
-    )
-    await callback.answer()
-
-# Обработка вводимых настроек пользователем
-@dp.message(lambda m: m.text and re.search(r"^(утро|день|вечер|ночь)\s+\d{1,2}-\d{1,2}", m.text.lower()))
-async def update_periods(message: types.Message):
-    lines = message.text.lower().splitlines()
-
-    for line in lines:
-        m = re.match(r"(утро|день|вечер|ночь)\s+(\d{1,2})-(\d{1,2})", line)
-        if m:
-            period, start, end = m.groups()
-            date_parser.PERIODS[period] = (int(start), int(end))
-
-    await message.answer("✅ Периоды дня обновлены!")
+        await message.answer("Привет! 👋 Для регистрации, пожалуйста, отправь свой номер телефона:", reply_markup=kb_reg)
 
 @dp.message(lambda message: message.contact is not None)
 async def contact_handler(message: types.Message):
@@ -475,110 +236,82 @@ async def contact_handler(message: types.Message):
         cursor.execute("INSERT INTO users (user_id, first_name, phone) VALUES (?, ?, ?)",
                        (user_id, first_name, phone))
         conn.commit()
-        await message.answer(
-            f"✅ Спасибо, {first_name}! Ты успешно зарегистрирован.\nТеперь можешь добавить своё расписание 📅",
-            reply_markup=ReplyKeyboardMarkup(
-                keyboard=[
-                    [KeyboardButton(text="⏰ Создать напоминание")],
-                    [KeyboardButton(text="📋 Мои напоминания")],
-                    [KeyboardButton(text="⚙️ Настройки")]
-                ],
-                resize_keyboard=True
-            )
-        )
+        await message.answer(f"✅ Спасибо, {first_name}! Ты успешно зарегистрирован.", reply_markup=ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text="⏰ Создать напоминание")],
+                [KeyboardButton(text="📋 Мои напоминания")],
+                [KeyboardButton(text="📅 Расписание")],
+                [KeyboardButton(text="⚙️ Настройки")]
+            ],
+            resize_keyboard=True
+        ))
     else:
-        await message.answer(
-            "Ты уже зарегистрирован ✅",
-            reply_markup=ReplyKeyboardMarkup(
-                keyboard=[
-                    [KeyboardButton(text="⏰ Создать напоминание")],
-                    [KeyboardButton(text="📋 Мои напоминания")],
-                    [KeyboardButton(text="⚙️ Настройки")]
-                ],
-                resize_keyboard=True
-            )
-        )
+        await message.answer("Ты уже зарегистрирован ✅")
 
-# ========================
-# СИСТЕМА НАПОМИНАНИЙ
-# ========================
+# ---------- УВЕДОМЛЕНИЯ: фоновая задача ----------
+async def reminder_scheduler():
+    while True:
+        try:
+            now = datetime.now()
+            cursor.execute("""
+                SELECT * FROM reminders
+                WHERE reminder_time <= ? AND sent = 0
+            """, (now,))
+            reminders = cursor.fetchall()
+            for rem in reminders:
+                try:
+                    await bot.send_message(rem['user_id'], f"🔔 *Напоминание!*\n\n{rem['reminder_text']}", parse_mode="Markdown")
+                    cursor.execute("UPDATE reminders SET sent = 1 WHERE id = ?", (rem['id'],))
+                    conn.commit()
+                except Exception as e:
+                    logging.error("Ошибка отправки напоминания %s: %s", rem['id'], e)
+            # Проверять каждые 30 сек
+            await asyncio.sleep(30)
+        except Exception as e:
+            logging.error("Ошибка в reminder_scheduler: %s", e)
+            await asyncio.sleep(60)
 
+# ---------- НАПОМИНАНИЯ (сохраняем функционал) ----------
 @dp.message(Command("reminder"))
 @dp.message(lambda message: message.text == "⏰ Создать напоминание")
 @user_registered
 async def reminder_command(message: types.Message, state: FSMContext):
-    # Создаем инлайн-кнопки для выбора метода
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📝 Текстом", callback_data="method_text")],
-            [InlineKeyboardButton(text="🔘 Кнопочками", callback_data="method_buttons")],
-            [InlineKeyboardButton(text="🎤 Голосом", callback_data="method_voice")]
-        ]
-    )
-    
-    await message.answer(
-        "Выбери способ создания напоминания:",
-        reply_markup=keyboard
-    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📝 Текстом", callback_data="method_text")],
+        [InlineKeyboardButton(text="🔘 Кнопочками", callback_data="method_buttons")],
+        [InlineKeyboardButton(text="🎤 Голосом", callback_data="method_voice")]
+    ])
+    await message.answer("Выбери способ создания напоминания:", reply_markup=keyboard)
     await state.set_state(ReminderForm.waiting_for_method)
 
-@dp.callback_query(ReminderForm.waiting_for_method)
+@dp.callback_query(lambda c: c.data and c.data.startswith("method_"))
 async def process_method(callback: types.CallbackQuery, state: FSMContext):
     method = callback.data
-    
     if method == "method_text":
-        await callback.message.answer(
-            "📝 Напиши текст напоминания с указанием времени.\n\n"
-            "Примеры:\n"
-            "• «Завтра в 10:00 позвонить маме»\n"
-            "• «Через 2 дня в 15:30 встреча у врача»\n"
-            "• «Сегодня вечером в 19:00 купить продукты»"
-        )
+        await callback.message.answer("📝 Напиши текст напоминания с указанием времени.\nПример: «Завтра в 10:00 позвонить маме»")
         await state.set_state(ReminderForm.waiting_for_text)
-    
     elif method == "method_buttons":
-        # Начинаем процесс выбора даты через кнопки
-        await select_year(callback.message, state)
-    
+        # Используем простую кнопку выбора даты/времени через текст — перенаправим на схему выбора даты
+        await callback.message.answer("Выбери дату и время через команды. Напиши, например: 25.12.2025 14:30\nИли используй голосовой метод.")
+        await state.set_state(ReminderForm.waiting_for_text)
     elif method == "method_voice":
-        await callback.message.answer(
-            "🎤 Запиши голосовое сообщение с напоминанием.\n\n"
-            "Пример: «Напомни завтра в 14:00 о встрече с коллегами»"
-        )
+        await callback.message.answer("🎤 Отправь голосовое сообщение с напоминанием (пример: «Напомни завтра в 14:00 о встрече»)")
         await state.set_state(ReminderForm.waiting_for_voice)
-    
     await callback.answer()
 
-# Обработка текстового напоминания
 @dp.message(ReminderForm.waiting_for_text)
 async def process_text_reminder(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     text = message.text
-    
-    # Используем нейросеть для парсинга даты
     reminder_time = date_parser.parse_date_from_text(text)
     reminder_text = date_parser.extract_reminder_text(text)
-    
     if reminder_time:
-        # Сохраняем напоминание в базу
-        cursor.execute(
-            "INSERT INTO reminders (user_id, reminder_text, reminder_time) VALUES (?, ?, ?)",
-            (user_id, reminder_text, reminder_time)
-        )
+        cursor.execute("INSERT INTO reminders (user_id, reminder_text, reminder_time) VALUES (?, ?, ?)",
+                       (user_id, reminder_text, reminder_time))
         conn.commit()
-        
-        await message.answer(
-            f"✅ Напоминание создано!\n"
-            f"📋 *Что:* {reminder_text}\n"
-            f"⏰ *Когда:* {reminder_time.strftime('%d.%m.%Y в %H:%M')}",
-            parse_mode="Markdown"
-        )
+        await message.answer(f"✅ Напоминание создано!\n📋 Что: {reminder_text}\n⏰ Когда: {reminder_time.strftime('%d.%m.%Y в %H:%M')}")
     else:
-        await message.answer(
-            "❌ Не удалось распознать дату и время в тексте.\n"
-            "Попробуй еще раз, например: «Завтра в 10:00 позвонить маме»"
-        )
-    
+        await message.answer("❌ Не удалось распознать дату/время. Попробуй формат: 25.12.2025 14:30 или «завтра в 10:00 ...»")
     await state.clear()
 
 @dp.message(ReminderForm.waiting_for_voice)
@@ -586,289 +319,390 @@ async def process_voice_reminder(message: types.Message, state: FSMContext):
     if not message.voice:
         await message.answer("❌ Пожалуйста, отправь голосовое сообщение.")
         return
-
     ogg_path = "voice.ogg"
     wav_path = "voice.wav"
-
     try:
         await message.answer("🔊 Скачиваю голосовое сообщение...")
-
-        # Скачиваем файл из Telegram
         file = await bot.get_file(message.voice.file_id)
         await bot.download_file(file.file_path, destination=ogg_path)
-
-        # Проверяем, что файл реально скачался
-        if not os.path.exists(ogg_path):
-            await message.answer("❌ Ошибка: файл голосового сообщения не найден после скачивания.")
-            return
-
-        await message.answer("🔄 Конвертирую аудио...")
-
-        # Проверяем наличие ffmpeg
+        # Проверка ffmpeg
         from pydub.utils import which
         if not which("ffmpeg"):
-            await message.answer("⚠️ Ошибка: ffmpeg не установлен или не добавлен в PATH.\n"
-                                 "1️⃣ Скачай с сайта: https://www.gyan.dev/ffmpeg/builds/\n"
-                                 "2️⃣ Добавь в PATH, например C:\\ffmpeg\\bin")
+            await message.answer("⚠️ ffmpeg не найден. Установи ffmpeg и добавь в PATH.")
             return
-
-        # Конвертация ogg → wav
-        try:
-            audio = AudioSegment.from_file(ogg_path, format="ogg", codec="opus")
-            audio.export(wav_path, format="wav")
-        except Exception as e:
-            await message.answer(f"❌ Ошибка при конвертации аудио: {e}")
-            return
-
+        audio = AudioSegment.from_file(ogg_path, format="ogg", codec="opus")
+        audio.export(wav_path, format="wav")
         await message.answer("🎤 Распознаю речь...")
-
-        # Распознавание речи
         recognizer = sr.Recognizer()
         with sr.AudioFile(wav_path) as source:
             audio_data = recognizer.record(source)
             try:
                 recognized_text = recognizer.recognize_google(audio_data, language="ru-RU")
             except sr.UnknownValueError:
-                await message.answer("❌ Не удалось распознать речь. Попробуй сказать четче или напиши текстом.")
+                await message.answer("❌ Не удалось распознать речь. Попробуй снова или напиши текстом.")
                 await state.set_state(ReminderForm.waiting_for_text)
                 return
             except sr.RequestError as e:
-                await message.answer(f"⚠️ Ошибка при подключении к Google Speech API: {e}")
+                await message.answer(f"⚠️ Ошибка сервиса распознавания: {e}")
                 return
-
-        await message.answer(f"🎤 Распознанный текст:\n\n`{recognized_text}`", parse_mode="Markdown")
-
-        # Извлекаем дату и текст
+        await message.answer(f"🎤 Распознано: `{recognized_text}`", parse_mode="Markdown")
         reminder_time = date_parser.parse_date_from_text(recognized_text)
         reminder_text = date_parser.extract_reminder_text(recognized_text)
-
         if reminder_time:
-            user_id = message.from_user.id
-            cursor.execute(
-                "INSERT INTO reminders (user_id, reminder_text, reminder_time) VALUES (?, ?, ?)",
-                (user_id, reminder_text, reminder_time)
-            )
+            cursor.execute("INSERT INTO reminders (user_id, reminder_text, reminder_time) VALUES (?, ?, ?)",
+                           (message.from_user.id, reminder_text, reminder_time))
             conn.commit()
-
-            await message.answer(
-                f"✅ *Напоминание создано из голосового сообщения!*\n\n"
-                f"📋 *Что:* {reminder_text}\n"
-                f"⏰ *Когда:* {reminder_time.strftime('%d.%m.%Y в %H:%M')}",
-                parse_mode="Markdown"
-            )
+            await message.answer(f"✅ Напоминание создано из голоса!\n📋 {reminder_text}\n⏰ {reminder_time.strftime('%d.%m.%Y в %H:%M')}", parse_mode="Markdown")
             await state.clear()
         else:
-            await message.answer(
-                "❌ Не удалось распознать дату и время.\nПопробуй сказать четче или введи текст вручную."
-            )
+            await message.answer("❌ Не удалось распознать дату/время в голосе. Введи текстом.")
             await state.set_state(ReminderForm.waiting_for_text)
-
     except Exception as e:
-        import traceback
-        logging.error("Voice processing error: %s", traceback.format_exc())
+        logging.error("Voice proc error: %s", e)
         await message.answer(f"❌ Ошибка при обработке голосового сообщения: {e}")
         await state.set_state(ReminderForm.waiting_for_text)
-
     finally:
-        # Удаляем временные файлы
-        for path in (ogg_path, wav_path):
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except Exception:
-                    pass
+        for p in (ogg_path, wav_path):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except:
+                pass
 
-# ========================
-# ПРОСМОТР НАПОМИНАНИЙ
-# ========================
-
+# Список напоминаний
 @dp.message(Command("my_reminders"))
 @dp.message(lambda message: message.text == "📋 Мои напоминания")
 @user_registered
 async def list_reminders(message: types.Message):
     user_id = message.from_user.id
-    cursor.execute("""
-        SELECT id, reminder_text, reminder_time 
-        FROM reminders 
-        WHERE user_id = ? AND sent = 0 
-        ORDER BY reminder_time
-    """, (user_id,))
-    
+    cursor.execute("SELECT id, reminder_text, reminder_time FROM reminders WHERE user_id = ? AND sent = 0 ORDER BY reminder_time", (user_id,))
     reminders = cursor.fetchall()
     if not reminders:
         await message.answer("📭 У вас нет активных напоминаний")
         return
-    
     text = "📋 Ваши активные напоминания:\n\n"
     for rem in reminders:
-        text += f"• {rem['reminder_text']} - {rem['reminder_time'].strftime('%d.%m.%Y %H:%M')}\n"
-    
+        rt = parse_datetime_from_db(rem['reminder_time'])
+        time_str = rt.strftime('%d.%m.%Y %H:%M') if rt else "неизвестно"
+        text += f"• {rem['reminder_text']} — {time_str}\n"
     await message.answer(text)
 
-# Функции для выбора даты через кнопки
-async def select_year(message: types.Message, state: FSMContext):
-    current_year = datetime.now().year
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=str(year), callback_data=f"year_{year}") 
-             for year in range(current_year, current_year + 3)],
-            [InlineKeyboardButton(text="Отмена", callback_data="cancel")]
-        ]
-    )
-    await message.answer("Выбери год:", reply_markup=keyboard)
-    await state.set_state(ReminderForm.waiting_for_year)
-
-async def select_month(message: types.Message, state: FSMContext, year: int):
-    months = [
-        "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
-        "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"
-    ]
-    
-    keyboard_buttons = []
-    for i in range(0, 12, 3):
-        row = [
-            InlineKeyboardButton(text=months[j], callback_data=f"month_{j+1}") 
-            for j in range(i, min(i+3, 12))
-        ]
-        keyboard_buttons.append(row)
-    
-    keyboard_buttons.append([InlineKeyboardButton(text="Назад", callback_data="back_to_year")])
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
-    await message.answer(f"Выбери месяц для {year} года:", reply_markup=keyboard)
-    await state.set_state(ReminderForm.waiting_for_month)
-
-async def select_day(message: types.Message, state: FSMContext, year: int, month: int):
-    # Определяем количество дней в месяце
-    if month == 12:
-        next_month = 1
-        next_year = year + 1
-    else:
-        next_month = month + 1
-        next_year = year
-    
-    last_day = (datetime(next_year, next_month, 1) - timedelta(days=1)).day
-    
-    # Создаем кнопки с днями
-    keyboard_buttons = []
-    row = []
-    for day in range(1, last_day + 1):
-        row.append(InlineKeyboardButton(text=str(day), callback_data=f"day_{day}"))
-        if len(row) == 7:
-            keyboard_buttons.append(row)
-            row = []
-    if row:
-        keyboard_buttons.append(row)
-    
-    keyboard_buttons.append([
-        InlineKeyboardButton(text="Назад", callback_data="back_to_month")
+# ---------- НОВОЕ: РАСПИСАНИЕ (по датам) ----------
+# Меню /schedule показывает меню A (как обсуждали)
+@dp.message(Command("schedule"))
+@dp.message(lambda message: message.text == "📅 Расписание")
+@user_registered
+async def schedule_command(message: types.Message):
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👀 Показать задачи", callback_data="sched_show")],
+        [InlineKeyboardButton(text="🕒 Сегодня", callback_data="sched_today"),
+         InlineKeyboardButton(text="🌅 Завтра", callback_data="sched_tomorrow"),
+         InlineKeyboardButton(text="🗓 Выбрать дату", callback_data="sched_pick_date")],
+        [InlineKeyboardButton(text="➕ Добавить задачу", callback_data="sched_add")],
+        [InlineKeyboardButton(text="✏️ Редактировать/Удалить", callback_data="sched_edit")]
     ])
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
-    month_names = [
-        "Января", "Февраля", "Марта", "Апреля", "Мая", "Июня",
-        "Июля", "Августа", "Сентября", "Октября", "Ноября", "Декабря"
-    ]
-    await message.answer(f"Выбери день {month_names[month-1]}:", reply_markup=keyboard)
-    await state.set_state(ReminderForm.waiting_for_day)
+    await message.answer("📅 Управление расписанием:", reply_markup=keyboard)
 
-async def select_time(message: types.Message, state: FSMContext):
-    keyboard_buttons = []
-    for hour in range(0, 24, 4):
-        row = []
-        for h in range(hour, min(hour + 4, 24)):
-            for minute in ['00', '30']:
-                time_str = f"{h:02d}:{minute}"
-                row.append(InlineKeyboardButton(text=time_str, callback_data=f"time_{time_str}"))
-        keyboard_buttons.append(row)
-    
-    keyboard_buttons.append([
-        InlineKeyboardButton(text="Назад", callback_data="back_to_day")
+# Helpers: format schedule items
+def format_schedule_rows(rows):
+    if not rows:
+        return "📭 Нет задач."
+    text = ""
+    for r in rows:
+        dt = parse_datetime_from_db(r['due_at'])
+        dt_str = dt.strftime('%d.%m.%Y %H:%M') if dt else "неизвестно"
+        text += f"• [{r['id']}] {dt_str} — {r['title']}\n"
+    return text
+
+# Показать все задачи (вперед)
+@dp.callback_query(lambda c: c.data == "sched_show")
+async def sched_show_all(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    cursor.execute("SELECT id, title, due_at FROM schedule_items WHERE user_id = ? ORDER BY due_at LIMIT 200", (user_id,))
+    rows = cursor.fetchall()
+    await callback.message.edit_text("📋 Ваши задачи:\n\n" + format_schedule_rows(rows), reply_markup=InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="⬅️ В меню", callback_data="sched_back")]]
+    ))
+    await callback.answer()
+
+# Сегодня
+@dp.callback_query(lambda c: c.data == "sched_today")
+async def sched_today(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    today = datetime.now().date()
+    start = datetime.combine(today, datetime.min.time())
+    end = datetime.combine(today, datetime.max.time())
+    cursor.execute("SELECT id, title, due_at FROM schedule_items WHERE user_id = ? AND due_at BETWEEN ? AND ? ORDER BY due_at", (user_id, start, end))
+    rows = cursor.fetchall()
+    await callback.message.edit_text(f"📅 Задачи на сегодня ({today.strftime('%d.%m.%Y')}):\n\n" + format_schedule_rows(rows),
+                                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                         [InlineKeyboardButton(text="⬅️ В меню", callback_data="sched_back"),
+                                          InlineKeyboardButton(text="➕ Добавить", callback_data="sched_add")]
+                                     ]))
+    await callback.answer()
+
+# Завтра
+@dp.callback_query(lambda c: c.data == "sched_tomorrow")
+async def sched_tomorrow(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    tomorrow = (datetime.now().date() + timedelta(days=1))
+    start = datetime.combine(tomorrow, datetime.min.time())
+    end = datetime.combine(tomorrow, datetime.max.time())
+    cursor.execute("SELECT id, title, due_at FROM schedule_items WHERE user_id = ? AND due_at BETWEEN ? AND ? ORDER BY due_at", (user_id, start, end))
+    rows = cursor.fetchall()
+    await callback.message.edit_text(f"📅 Задачи на завтра ({tomorrow.strftime('%d.%m.%Y')}):\n\n" + format_schedule_rows(rows),
+                                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                         [InlineKeyboardButton(text="⬅️ В меню", callback_data="sched_back"),
+                                          InlineKeyboardButton(text="➕ Добавить", callback_data="sched_add")]
+                                     ]))
+    await callback.answer()
+
+# Выбрать дату — переводим в state: просим дату в формате DD.MM.YYYY
+@dp.callback_query(lambda c: c.data == "sched_pick_date")
+async def sched_pick_date(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("🗓 Введи дату в формате DD.MM.YYYY (например, 25.12.2025):")
+    await state.set_state(ScheduleForm.waiting_for_date)
+    await callback.answer()
+
+@dp.message(ScheduleForm.waiting_for_date)
+@user_registered
+async def sched_date_input(message: types.Message, state: FSMContext):
+    txt = message.text.strip()
+    try:
+        d = datetime.strptime(txt, '%d.%m.%Y').date()
+    except:
+        await message.answer("❌ Неверный формат даты. Используй DD.MM.YYYY")
+        return
+    start = datetime.combine(d, datetime.min.time()); end = datetime.combine(d, datetime.max.time())
+    user_id = message.from_user.id
+    cursor.execute("SELECT id, title, due_at FROM schedule_items WHERE user_id = ? AND due_at BETWEEN ? AND ? ORDER BY due_at", (user_id, start, end))
+    rows = cursor.fetchall()
+    await message.answer(f"📅 Задачи на {d.strftime('%d.%m.%Y')}:\n\n" + format_schedule_rows(rows),
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                             [InlineKeyboardButton(text="⬅️ В меню", callback_data="sched_back"),
+                              InlineKeyboardButton(text="➕ Добавить", callback_data="sched_add")]
+                         ]))
+    await state.clear()
+
+# Добавить задачу (пошагово: дата -> текст -> время)
+@dp.callback_query(lambda c: c.data == "sched_add")
+async def sched_add_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("➕ Создание задачи.\nВведи дату в формате DD.MM.YYYY (например, 25.12.2025):")
+    await state.set_state(ScheduleForm.waiting_for_date)
+    await callback.answer()
+
+@dp.message(ScheduleForm.waiting_for_date)
+@user_registered
+async def sched_add_date(message: types.Message, state: FSMContext):
+    txt = message.text.strip()
+    try:
+        d = datetime.strptime(txt, '%d.%m.%Y').date()
+    except:
+        await message.answer("❌ Неверный формат даты. Попробуй DD.MM.YYYY")
+        return
+    await state.update_data(sched_date=str(d))
+    await message.answer("📝 Теперь введи текст задачи (коротко):")
+    await state.set_state(ScheduleForm.waiting_for_title)
+
+@dp.message(ScheduleForm.waiting_for_title)
+async def sched_add_title(message: types.Message, state: FSMContext):
+    title = message.text.strip()
+    if not title:
+        await message.answer("❌ Текст задачи пустой. Введи текст.")
+        return
+    await state.update_data(sched_title=title)
+    await message.answer("⏰ Укажи время в формате ЧЧ:ММ (например, 14:30):")
+    await state.set_state(ScheduleForm.waiting_for_time)
+
+@dp.message(ScheduleForm.waiting_for_time)
+async def sched_add_time(message: types.Message, state: FSMContext):
+    t = message.text.strip()
+    m = re.match(r'^(\d{1,2}):(\d{2})$', t)
+    if not m:
+        await message.answer("❌ Неверный формат времени. Используй ЧЧ:ММ")
+        return
+    h, mi = int(m.group(1)), int(m.group(2))
+    if not (0 <= h < 24 and 0 <= mi < 60):
+        await message.answer("❌ Неверное время.")
+        return
+    data = await state.get_data()
+    d = datetime.strptime(data['sched_date'], '%Y-%m-%d').date()
+    due_at = datetime(d.year, d.month, d.day, h, mi)
+    if due_at < datetime.now():
+        await message.answer("❌ Нельзя создавать задачу в прошлом.")
+        return
+    user_id = message.from_user.id
+    title = data['sched_title']
+    cursor.execute("INSERT INTO schedule_items (user_id, title, due_at) VALUES (?, ?, ?)", (user_id, title, due_at))
+    conn.commit()
+    await message.answer(f"✅ Задача добавлена:\n{due_at.strftime('%d.%m.%Y %H:%M')} — {title}", reply_markup=InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="⬅️ В меню", callback_data="sched_back")]]
+    ))
+    await state.clear()
+
+# Редактирование/удаление: показываем список задач с кнопками
+@dp.callback_query(lambda c: c.data == "sched_edit")
+async def sched_edit_start(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    cursor.execute("SELECT id, title, due_at FROM schedule_items WHERE user_id = ? ORDER BY due_at LIMIT 100", (user_id,))
+    rows = cursor.fetchall()
+    if not rows:
+        await callback.message.edit_text("📭 Нет задач для редактирования.", reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ В меню", callback_data="sched_back")]]
+        ))
+        await callback.answer()
+        return
+    kb = InlineKeyboardMarkup()
+    for r in rows:
+        dt = parse_datetime_from_db(r['due_at'])
+        lab = f"{dt.strftime('%d.%m.%Y %H:%M')} — {r['title'][:30]}"
+        kb.add(InlineKeyboardButton(text=lab, callback_data=f"sched_edit_item_{r['id']}"))
+    kb.add(InlineKeyboardButton(text="⬅️ В меню", callback_data="sched_back"))
+    await callback.message.edit_text("✏️ Выбери задачу для редактирования:", reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("sched_edit_item_"))
+async def sched_edit_item(callback: types.CallbackQuery, state: FSMContext):
+    item_id = int(callback.data.split("_")[-1])
+    cursor.execute("SELECT id, title, due_at FROM schedule_items WHERE id = ?", (item_id,))
+    item = cursor.fetchone()
+    if not item:
+        await callback.answer("❌ Задача не найдена")
+        return
+    dt = parse_datetime_from_db(item['due_at'])
+    text = f"✏️ Задача #{item['id']}\n{dt.strftime('%d.%m.%Y %H:%M')} — {item['title']}\n\nВыбери действие:"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Изменить текст", callback_data=f"sched_action_change_text_{item_id}")],
+        [InlineKeyboardButton(text="📅 Изменить дату/время", callback_data=f"sched_action_change_dt_{item_id}")],
+        [InlineKeyboardButton(text="🗑️ Удалить", callback_data=f"sched_action_delete_{item_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="sched_edit")]
     ])
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
-    await message.answer("Выбери время:", reply_markup=keyboard)
-    await state.set_state(ReminderForm.waiting_for_time)
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
 
-# Обработчики callback для выбора даты
-@dp.callback_query(ReminderForm.waiting_for_year)
-async def process_year(callback: types.CallbackQuery, state: FSMContext):
-    if callback.data == "cancel":
-        await callback.message.answer("❌ Создание напоминания отменено")
+# Обработчики действий редактирования
+@dp.callback_query(lambda c: c.data and c.data.startswith("sched_action_change_text_"))
+async def sched_change_text_start(callback: types.CallbackQuery, state: FSMContext):
+    item_id = int(callback.data.split("_")[-1])
+    await state.update_data(edit_item_id=item_id)
+    await callback.message.edit_text("📝 Введи новый текст для задачи:")
+    await state.set_state(ScheduleForm.editing_action)
+    await callback.answer()
+
+@dp.message(ScheduleForm.editing_action)
+async def sched_change_text_finish(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    item_id = data.get('edit_item_id')
+    if not item_id:
+        await message.answer("❌ Ошибка. Попробуй снова.")
         await state.clear()
         return
-    
-    year = int(callback.data.split('_')[1])
-    await state.update_data(year=year)
-    await select_month(callback.message, state, year)
+    new_text = message.text.strip()
+    cursor.execute("UPDATE schedule_items SET title = ? WHERE id = ?", (new_text, item_id))
+    conn.commit()
+    await message.answer("✅ Текст задачи обновлён.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ В меню расписания", callback_data="sched_back")]
+    ]))
+    await state.clear()
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("sched_action_change_dt_"))
+async def sched_change_dt_start(callback: types.CallbackQuery, state: FSMContext):
+    item_id = int(callback.data.split("_")[-1])
+    await state.update_data(edit_item_id=item_id)
+    await callback.message.edit_text("📅 Введи новую дату DD.MM.YYYY:")
+    await state.set_state(ScheduleForm.waiting_for_date)
     await callback.answer()
 
-@dp.callback_query(ReminderForm.waiting_for_month)
-async def process_month(callback: types.CallbackQuery, state: FSMContext):
-    if callback.data == "back_to_year":
-        await select_year(callback.message, state)
-        return
-    
-    month = int(callback.data.split('_')[1])
+# Reuse waiting_for_date & waiting_for_time to change dt: after date -> ask time -> save
+@dp.message(ScheduleForm.waiting_for_date)
+async def sched_change_dt_date(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    year = data['year']
-    await state.update_data(month=month)
-    await select_day(callback.message, state, year, month)
-    await callback.answer()
-
-@dp.callback_query(ReminderForm.waiting_for_day)
-async def process_day(callback: types.CallbackQuery, state: FSMContext):
-    if callback.data == "back_to_month":
-        data = await state.get_data()
-        await select_month(callback.message, state, data['year'])
+    # If editing flow (edit_item_id present) -> change date then time
+    if data.get('edit_item_id'):
+        txt = message.text.strip()
+        try:
+            d = datetime.strptime(txt, '%d.%m.%Y').date()
+        except:
+            await message.answer("❌ Неверный формат даты. Используй DD.MM.YYYY")
+            return
+        await state.update_data(edit_new_date=str(d))
+        await message.answer("⏰ Теперь введи время ЧЧ:ММ:")
+        await state.set_state(ScheduleForm.waiting_for_time)
         return
-    
-    day = int(callback.data.split('_')[1])
-    await state.update_data(day=day)
-    await select_time(callback.message, state)
-    await callback.answer()
+    # Otherwise it's part of adding flow; handled earlier
+    await message.answer("Неожиданный ввод. Если ты создаешь задачу — начни снова.")
+    await state.clear()
 
-@dp.callback_query(ReminderForm.waiting_for_time)
-async def process_time(callback: types.CallbackQuery, state: FSMContext):
-    if callback.data == "back_to_day":
-        data = await state.get_data()
-        await select_day(callback.message, state, data['year'], data['month'])
-        return
-    
-    time_str = callback.data.split('_')[1]
+@dp.message(ScheduleForm.waiting_for_time)
+async def sched_change_dt_time_finish(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    
-    # Собираем полную дату
-    year = data['year']
-    month = data['month']
-    day = data['day']
-    hour, minute = map(int, time_str.split(':'))
-    
-    reminder_time = datetime(year, month, day, hour, minute)
-    
-    # Проверяем, что дата не в прошлом
-    if reminder_time < datetime.now():
-        await callback.message.answer("❌ Нельзя установить напоминание на прошедшее время!")
-        await select_time(callback.message, state)
+    if data.get('edit_item_id') and data.get('edit_new_date'):
+        t = message.text.strip()
+        m = re.match(r'^(\d{1,2}):(\d{2})$', t)
+        if not m:
+            await message.answer("❌ Неверный формат времени. Используй ЧЧ:ММ")
+            return
+        h, mi = int(m.group(1)), int(m.group(2))
+        if not (0 <= h < 24 and 0 <= mi < 60):
+            await message.answer("❌ Неверное время.")
+            return
+        d = datetime.strptime(data['edit_new_date'], '%Y-%m-%d').date()
+        new_dt = datetime(d.year, d.month, d.day, h, mi)
+        if new_dt < datetime.now():
+            await message.answer("❌ Нельзя установить в прошлое.")
+            return
+        cursor.execute("UPDATE schedule_items SET due_at = ? WHERE id = ?", (new_dt, data['edit_item_id']))
+        conn.commit()
+        await message.answer("✅ Дата/время задачи обновлены.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ В меню расписания", callback_data="sched_back")]
+        ]))
+        await state.clear()
         return
-    
-    await state.update_data(reminder_time=reminder_time)
-    
-    # Запрашиваем текст напоминания
-    await callback.message.answer("📝 Теперь введи текст напоминания:")
-    await state.set_state(ReminderForm.waiting_for_text)
+    # If we're here, it's likely the add flow handled earlier
+    await message.answer("❌ Неверный контекст. Начни действие снова.")
+    await state.clear()
+
+@dp.callback_query(lambda c: c.data and c.data.startswith("sched_action_delete_"))
+async def sched_delete(callback: types.CallbackQuery):
+    item_id = int(callback.data.split("_")[-1])
+    cursor.execute("SELECT title FROM schedule_items WHERE id = ?", (item_id,))
+    item = cursor.fetchone()
+    if not item:
+        await callback.answer("❌ Задача не найдена")
+        return
+    cursor.execute("DELETE FROM schedule_items WHERE id = ?", (item_id,))
+    conn.commit()
+    await callback.message.edit_text(f"✅ Задача удалена: {item['title']}", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ В меню", callback_data="sched_back")]
+    ]))
     await callback.answer()
 
-# ========================
-# ЗАПУСК БОТА
-# ========================
+# Навигация назад
+@dp.callback_query(lambda c: c.data == "sched_back")
+async def sched_back(callback: types.CallbackQuery):
+    await schedule_command(callback.message)
+    await callback.answer()
 
+# ---------- Удаляем CSV-экспорт: не регистрируем обработчики экспорта ----------
+# (в предыдущей версии были функции export_history_callback и кнопки — теперь их нет)
+
+# ---------- Settings (минимально) ----------
+@dp.message(Command("settings"))
+async def settings_handler(message: types.Message):
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔧 Параметры", callback_data="settings_params")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="settings_back")]
+    ])
+    await message.answer("⚙️ Настройки:", reply_markup=keyboard)
+
+# ---------- Запуск бота ----------
 async def main():
     # Запускаем фоновую задачу для напоминаний
     asyncio.create_task(reminder_scheduler())
-    
     logging.info("Бот запущен!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
+    asyncio.run(main())
+
     asyncio.run(main())
